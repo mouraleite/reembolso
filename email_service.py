@@ -13,14 +13,24 @@ from email.mime.application import MIMEApplication
 logger = logging.getLogger("reembolsos.email")
 
 # ==============================================================================
-# CONFIGURAÇÃO DE REMETENTE E PROVEDORES
+# CONFIGURAÇÃO DE AMBIENTE E REMETENTE
 # ==============================================================================
-# O remetente do sistema é lido dinamicamente da variável AZURE_MAIL_SENDER
-# (ex: financeiro@mouraleite.com.br). Nenhum endereço de e-mail é fixado no código.
+def is_production() -> bool:
+    """
+    Verifica se a aplicação está executando em ambiente de produção.
+    """
+    return bool(
+        os.environ.get("VERCEL") or
+        os.environ.get("ENVIRONMENT", "").strip().lower() in ("production", "prod") or
+        os.environ.get("NODE_ENV", "").strip().lower() == "production"
+    )
+
+
 def get_sender_email() -> str:
     """
     Retorna o endereço do remetente obtido das variáveis de ambiente.
     Prioridade: AZURE_MAIL_SENDER -> SMTP_FROM -> SMTP_USER.
+    Nenhum e-mail fixo é mantido no código.
     """
     return (
         os.environ.get("AZURE_MAIL_SENDER", "").strip() or
@@ -119,7 +129,164 @@ def get_graph_access_token(force_refresh: bool = False) -> str:
 
 
 # ==============================================================================
-# MICROSOFT GRAPH API: DISPARO DE E-MAIL COM RETRY E TRATAMENTO DE ERROS
+# MICROSOFT GRAPH API: UPLOAD EM PARTES PARA ANEXOS GRANDES (> 3 MB)
+# ==============================================================================
+def _send_graph_mail_upload_session(
+    sender: str,
+    subject: str,
+    html_content: str,
+    to_recipients: list[str],
+    attachment_name: str,
+    attachment_bytes: bytes,
+    content_type: str = "application/pdf"
+) -> bool:
+    """
+    Envia e-mail com anexo grande (> 3 MB) via Microsoft Graph API usando Upload Session:
+    1. Cria mensagem como rascunho: POST /v1.0/users/{sender}/messages
+    2. Cria sessão de upload: POST /v1.0/users/{sender}/messages/{id}/attachments/createUploadSession
+    3. Faz upload dos blocos (múltiplos de 320 KiB): PUT {uploadUrl} com Content-Range
+    4. Dispara a mensagem: POST /v1.0/users/{sender}/messages/{id}/send
+    """
+    recipients_payload = [
+        {"emailAddress": {"address": email.strip()}}
+        for email in to_recipients
+        if email and "@" in email
+    ]
+    if not recipients_payload:
+        logger.warning("Nenhum destinatário de e-mail válido fornecido.")
+        return False
+
+    token = get_graph_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    # 1. Criar mensagem em rascunho
+    draft_url = f"https://graph.microsoft.com/v1.0/users/{sender}/messages"
+    draft_body = {
+        "subject": subject,
+        "body": {
+            "contentType": "HTML",
+            "content": html_content
+        },
+        "toRecipients": recipients_payload
+    }
+
+    try:
+        draft_resp = requests.post(draft_url, json=draft_body, headers=headers, timeout=25)
+    except Exception as exc:
+        logger.error(f"Erro ao criar rascunho no Graph: {exc}. Envio não será repetido para evitar duplicidade.")
+        return False
+
+    if draft_resp.status_code == 401:
+        token = get_graph_access_token(force_refresh=True)
+        headers["Authorization"] = f"Bearer {token}"
+        draft_resp = requests.post(draft_url, json=draft_body, headers=headers, timeout=25)
+
+    if draft_resp.status_code == 403:
+        err_msg = (
+            f"Acesso negado (403 ErrorAccessDenied) ao criar mensagem no Graph via '{sender}': "
+            "a caixa informada em AZURE_MAIL_SENDER está fora da liberação do Exchange Online (Application Mail.Send / RBAC)."
+        )
+        logger.error(err_msg)
+        raise PermissionError(err_msg)
+
+    if draft_resp.status_code not in (200, 201):
+        logger.error(f"Falha ao criar rascunho no Graph (HTTP {draft_resp.status_code}): {draft_resp.text}")
+        return False
+
+    message_id = draft_resp.json().get("id")
+    if not message_id:
+        logger.error("ID do rascunho não retornado pelo Microsoft Graph.")
+        return False
+
+    total_size = len(attachment_bytes)
+
+    # 2. Criar Sessão de Upload para o anexo
+    session_url = f"https://graph.microsoft.com/v1.0/users/{sender}/messages/{message_id}/attachments/createUploadSession"
+    session_payload = {
+        "AttachmentItem": {
+            "attachmentType": "file",
+            "name": attachment_name,
+            "size": total_size,
+            "contentType": content_type
+        }
+    }
+
+    try:
+        sess_resp = requests.post(session_url, json=session_payload, headers=headers, timeout=25)
+        if sess_resp.status_code not in (200, 201):
+            logger.error(f"Falha ao criar sessão de upload no Graph (HTTP {sess_resp.status_code}): {sess_resp.text}")
+            try:
+                requests.delete(f"https://graph.microsoft.com/v1.0/users/{sender}/messages/{message_id}", headers=headers, timeout=10)
+            except Exception:
+                pass
+            return False
+
+        upload_url = sess_resp.json().get("uploadUrl")
+        if not upload_url:
+            logger.error("URL da sessão de upload não retornada pelo Graph.")
+            try:
+                requests.delete(f"https://graph.microsoft.com/v1.0/users/{sender}/messages/{message_id}", headers=headers, timeout=10)
+            except Exception:
+                pass
+            return False
+
+        # 3. Upload em blocos (múltiplos de 320 KiB = 327.680 bytes)
+        CHUNK_SIZE = 320 * 1024
+        offset = 0
+
+        while offset < total_size:
+            chunk = attachment_bytes[offset:offset + CHUNK_SIZE]
+            chunk_len = len(chunk)
+            range_header = f"bytes {offset}-{offset + chunk_len - 1}/{total_size}"
+
+            chunk_headers = {
+                "Content-Length": str(chunk_len),
+                "Content-Range": range_header
+            }
+
+            chunk_resp = requests.put(upload_url, data=chunk, headers=chunk_headers, timeout=35)
+            if chunk_resp.status_code not in (200, 201, 202):
+                logger.error(f"Falha ao enviar bloco de anexo grande no Graph (HTTP {chunk_resp.status_code}): {chunk_resp.text}")
+                try:
+                    requests.delete(f"https://graph.microsoft.com/v1.0/users/{sender}/messages/{message_id}", headers=headers, timeout=10)
+                except Exception:
+                    pass
+                return False
+
+            offset += chunk_len
+
+        # 4. Enviar a mensagem com anexo completo anexado
+        send_url = f"https://graph.microsoft.com/v1.0/users/{sender}/messages/{message_id}/send"
+        send_resp = requests.post(send_url, headers=headers, timeout=25)
+
+        if send_resp.status_code in (200, 202, 204):
+            logger.info(f"E-mail com anexo grande ({total_size / (1024*1024):.2f} MB) enviado com sucesso via Graph para {to_recipients}")
+            return True
+
+        if send_resp.status_code == 429:
+            retry_after = int(send_resp.headers.get("Retry-After", "5"))
+            time.sleep(retry_after)
+            send_retry = requests.post(send_url, headers=headers, timeout=25)
+            if send_retry.status_code in (200, 202, 204):
+                return True
+
+        logger.error(f"Falha ao disparar mensagem com anexo grande no Graph (HTTP {send_resp.status_code}): {send_resp.text}")
+        return False
+
+    except Exception as exc:
+        logger.error(f"Exceção durante upload de anexo grande no Graph: {exc}. Envio não será repetido para evitar duplicidade.")
+        try:
+            requests.delete(f"https://graph.microsoft.com/v1.0/users/{sender}/messages/{message_id}", headers=headers, timeout=10)
+        except Exception:
+            pass
+        return False
+
+
+# ==============================================================================
+# MICROSOFT GRAPH API: DISPARO DE E-MAIL COM RETRY SELETIVO (APENAS 429 E 401)
 # ==============================================================================
 def _send_graph_mail(
     subject: str,
@@ -129,15 +296,34 @@ def _send_graph_mail(
 ) -> bool:
     """
     Dispara e-mail via Microsoft Graph API POST /v1.0/users/{AZURE_MAIL_SENDER}/sendMail.
-    - Resposta de sucesso esperada: HTTP 202 Accepted.
+    - Se houver anexo grande (> 3 MB), roteia automaticamente para Upload Session em blocos.
+    - Sucesso esperado: HTTP 202 Accepted.
     - Tratamento de 401: renova o token (force_refresh=True) e tenta novamente 1 vez.
-    - Tratamento de 403 (ErrorAccessDenied): a caixa está fora da política do Exchange Online.
-    - Tratamento de 429 ou 5xx: retry com exponential backoff até 3 vezes.
+    - Tratamento de 429 (throttling): retry respeitando o header Retry-After.
+    - NÃO repete em 5xx ou timeout (evita e-mails duplicados para o colaborador).
+    - Tratamento de 403 (ErrorAccessDenied): loga e lança PermissionError claro.
     - Nunca expõe ou loga tokens ou segredos.
     """
     sender = os.environ.get("AZURE_MAIL_SENDER", "").strip()
     if not sender:
         raise ValueError("Variável de ambiente AZURE_MAIL_SENDER não está configurada.")
+
+    # Verificar se algum anexo é maior que 3 MB (requer upload em partes)
+    if attachments:
+        for att in attachments:
+            raw_bytes = att.get("raw_bytes")
+            size = att.get("size", len(raw_bytes) if raw_bytes else 0)
+            if raw_bytes and size > 3 * 1024 * 1024:
+                logger.info(f"Anexo '{att.get('name')}' possui {size / (1024*1024):.2f} MB (> 3 MB). Utilizando Upload Session do Microsoft Graph.")
+                return _send_graph_mail_upload_session(
+                    sender=sender,
+                    subject=subject,
+                    html_content=html_content,
+                    to_recipients=to_recipients,
+                    attachment_name=att.get("name", "relatorio.pdf"),
+                    attachment_bytes=raw_bytes,
+                    content_type=att.get("contentType", "application/pdf")
+                )
 
     recipients_payload = [
         {"emailAddress": {"address": email.strip()}}
@@ -158,7 +344,17 @@ def _send_graph_mail(
     }
 
     if attachments:
-        message_payload["attachments"] = attachments
+        # Prepara anexos inline (apenas @odata.type, name, contentType e contentBytes)
+        clean_attachments = []
+        for att in attachments:
+            clean_att = {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": att.get("name", "anexo.pdf"),
+                "contentType": att.get("contentType", "application/pdf"),
+                "contentBytes": att.get("contentBytes", "")
+            }
+            clean_attachments.append(clean_att)
+        message_payload["attachments"] = clean_attachments
 
     request_body = {
         "message": message_payload,
@@ -202,40 +398,40 @@ def _send_graph_mail(
                 logger.error(err_msg)
                 raise PermissionError(err_msg)
 
-            # 429 Too Many Requests ou 5xx Server Error: retry com backoff
-            if resp.status_code == 429 or (500 <= resp.status_code < 600):
+            # 429 Too Many Requests (throttling): retry com respeito estrito ao Retry-After
+            if resp.status_code == 429:
                 if attempt < max_retries:
                     retry_after = resp.headers.get("Retry-After")
                     if retry_after and retry_after.isdigit():
-                        wait_sec = min(int(retry_after), 10)
+                        wait_sec = min(int(retry_after), 60)
                     else:
-                        wait_sec = 2 ** (attempt - 1)
+                        wait_sec = 2 ** attempt
                     logger.warning(
-                        f"Microsoft Graph retornou status {resp.status_code} na tentativa {attempt}/{max_retries}. "
-                        f"Aguardando {wait_sec}s antes de tentar novamente..."
+                        f"Microsoft Graph retornou 429 (throttling) na tentativa {attempt}/{max_retries}. "
+                        f"Aguardando {wait_sec}s conforme Retry-After antes de tentar novamente..."
                     )
                     time.sleep(wait_sec)
                     continue
                 else:
-                    logger.error(
-                        f"Falha ao enviar e-mail via Microsoft Graph após {max_retries} tentativas (Status {resp.status_code})."
-                    )
+                    logger.error("Limite de taxa do Microsoft Graph (429) excedido após tentativas.")
                     return False
 
-            # Outros erros (ex: 400 Bad Request, 404 Mailbox Not Found)
+            # Qualquer outro erro (5xx de servidor, 400, etc.): NÃO REPETIR para evitar envio duplicado ao colaborador
             logger.error(
-                f"Erro no envio de e-mail via Microsoft Graph (Status {resp.status_code}): {resp.text}"
+                f"Erro no envio de e-mail via Microsoft Graph (Status {resp.status_code}): {resp.text}. "
+                "Envio não será repetido para evitar duplicidade de mensagens."
             )
             return False
 
         except PermissionError:
             raise
         except Exception as exc:
-            logger.error(f"Exceção na tentativa {attempt}/{max_retries} ao enviar via Microsoft Graph: {exc}")
-            if attempt < max_retries:
-                time.sleep(2 ** (attempt - 1))
-            else:
-                return False
+            # Em caso de timeout ou falha de rede pós-envio, não repetir: o Graph pode ter processado o e-mail
+            logger.error(
+                f"Exceção de comunicação ao enviar via Microsoft Graph: {exc}. "
+                "Envio não será repetido para evitar duplicidade de e-mails recebidos."
+            )
+            return False
 
     return False
 
@@ -279,12 +475,14 @@ def _send_smtp_mail(
 
         if attachments:
             for att in attachments:
-                b64_content = att.get("contentBytes", "")
-                filename = att.get("name", "anexo.pdf")
-                raw_data = base64.b64decode(b64_content)
-                mime_att = MIMEApplication(raw_data, _subtype="pdf")
-                mime_att.add_header("Content-Disposition", "attachment", filename=filename)
-                msg.attach(mime_att)
+                raw_data = att.get("raw_bytes")
+                if not raw_data and att.get("contentBytes"):
+                    raw_data = base64.b64decode(att["contentBytes"])
+                if raw_data:
+                    filename = att.get("name", "anexo.pdf")
+                    mime_att = MIMEApplication(raw_data, _subtype="pdf")
+                    mime_att.add_header("Content-Disposition", "attachment", filename=filename)
+                    msg.attach(mime_att)
 
         with smtplib.SMTP(host, port, timeout=15) as server:
             if tls:
@@ -301,7 +499,7 @@ def _send_smtp_mail(
 
 
 # ==============================================================================
-# DISPACHER PRINCIPAL
+# DISPATCHER PRINCIPAL
 # ==============================================================================
 def send_email(
     subject: str,
@@ -311,10 +509,11 @@ def send_email(
     attachments: list[dict] = None
 ) -> bool:
     """
-    Ponto central de envio de e-mails:
-    1. Se Microsoft Graph estiver configurado, envia via API do Graph.
-    2. Se não, caso SMTP esteja configurado, envia via SMTP.
-    3. Em ambiente local/sem credenciais, registra a simulação no log e retorna True.
+    Ponto central de envio de e-mails do sistema:
+    1. Se o Microsoft Graph estiver configurado, utiliza a API do Graph.
+    2. Se não, caso haja SMTP configurado, utiliza SMTP.
+    3. Em produção, se nenhuma credencial estiver configurada, LANÇA ERRO (não simula).
+    4. Em desenvolvimento local offline/sem credenciais, registra a simulação no log e retorna True.
     """
     valid_recipients = [r.strip() for r in to_recipients if r and "@" in r]
     if not valid_recipients:
@@ -337,9 +536,19 @@ def send_email(
             attachments=attachments
         )
     else:
+        # Em produção, ausência de credenciais é erro crítico
+        if is_production():
+            err_msg = (
+                "Falha no envio de e-mail em produção: credenciais do Microsoft Graph não configuradas. "
+                "As variáveis de ambiente AZURE_MAIL_SENDER, AZURE_TENANT_ID, AZURE_CLIENT_ID e AZURE_CLIENT_SECRET "
+                "são estritamente obrigatórias no ambiente de produção."
+            )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
+
         logger.info(
             f"[SIMULAÇÃO E-MAIL] Para: {valid_recipients} | Assunto: {subject} "
-            f"(AZURE_MAIL_SENDER e SMTP não configurados no ambiente)"
+            f"(AZURE_MAIL_SENDER e SMTP não configurados no ambiente local)"
         )
         print(f"[E-mail Simulado] Para: {valid_recipients} | Assunto: {subject}")
         return True
@@ -461,8 +670,9 @@ def send_report_email(
 ) -> bool:
     """
     Envia relatório consolidado por e-mail com o arquivo PDF anexado.
-    Permite anexar o arquivo diretamente via Microsoft Graph API (contentBytes base64).
-    Todos os campos dinâmicos são tratados com html.escape.
+    - Se o PDF tiver até 3 MB, anexa diretamente em Base64 no sendMail.
+    - Se for maior que 3 MB, realiza upload em partes via Upload Session do Microsoft Graph.
+    - Todos os campos dinâmicos são sanitizados com html.escape.
     """
     if not user_email or "@" not in user_email:
         logger.warning(f"E-mail inválido ou não informado para {user_name} ({user_email})")
@@ -531,7 +741,7 @@ def send_report_email(
 </body>
 </html>"""
 
-    # Localização e leitura do PDF para anexo
+    # Leitura e empacotamento do PDF
     attachments = []
     actual_pdf = None
     if pdf_path:
@@ -544,6 +754,7 @@ def send_report_email(
         try:
             with open(actual_pdf, "rb") as f:
                 pdf_bytes = f.read()
+            pdf_size = len(pdf_bytes)
             safe_name = "".join(c for c in report_name if c.isalnum() or c in (" ", "-", "_", ".")).strip()
             if not safe_name.lower().endswith(".pdf"):
                 safe_name += ".pdf"
@@ -552,7 +763,9 @@ def send_report_email(
                 "@odata.type": "#microsoft.graph.fileAttachment",
                 "name": safe_name,
                 "contentType": "application/pdf",
-                "contentBytes": base64.b64encode(pdf_bytes).decode("utf-8")
+                "contentBytes": base64.b64encode(pdf_bytes).decode("utf-8") if pdf_size <= 3 * 1024 * 1024 else "",
+                "raw_bytes": pdf_bytes,
+                "size": pdf_size
             })
         except Exception as e:
             logger.error(f"Erro ao processar anexo PDF '{actual_pdf}': {e}")

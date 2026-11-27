@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import urllib.parse
 import unicodedata
 from typing import Optional
@@ -689,7 +690,7 @@ def bulk_send_export_emails(
     sent_count = 0
     failed_count = 0
 
-    for export in exports:
+    for idx, export in enumerate(exports):
         target_user = getattr(export, 'target_user', None)
         if not target_user and getattr(export, 'target_user_id', None):
             target_user = db.query(models.User).filter(models.User.id == export.target_user_id).first()
@@ -791,6 +792,10 @@ def bulk_send_export_emails(
         )
         db.add(audit)
         sent_count += 1
+
+        # Espaçar envios em lote para respeitar a taxa do Exchange Online (~30 e-mails/minuto = 1 a cada 2s)
+        if idx < len(exports) - 1:
+            time.sleep(2.0)
 
     db.commit()
 
