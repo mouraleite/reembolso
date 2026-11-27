@@ -35,7 +35,7 @@ def is_moura_leite_comp(comp) -> bool:
     code = str(getattr(comp, 'code', '') or '').strip()
     name = str(getattr(comp, 'name', '') or '').upper()
     comp_id = getattr(comp, 'id', None)
-    return comp_id == 1 or code == '1' or 'MOURA LEITE DESENVOLVIMENTO' in name
+    return comp_id == 1 or code in ('1', '01', '001') or 'MOURA LEITE' in name
 
 IS_VERCEL = bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
 EXPORT_DIR = "/tmp/exports" if (IS_VERCEL or not os.path.exists("exports")) else "exports"
@@ -403,7 +403,6 @@ def create_export(
                 export = models.Export(
                     name=export_record_name,
                     created_by=current_user.id,
-                    target_uid=target_uid if hasattr(models.Export, 'target_uid') else None,
                     target_user_id=target_uid,
                     expense_user_ids=json.dumps(exp_user_ids) if exp_user_ids else None,
                     export_type="Padrão",
