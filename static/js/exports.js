@@ -367,10 +367,6 @@ const ExportsPage = {
       'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
     ];
     const now = new Date();
-    const monthCapitalized = `${monthsPt[now.getMonth()]} de ${now.getFullYear()}`;
-
-    let dateFromVal = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
-    let dateToVal = now.toISOString().slice(0, 10);
     let targetUserName = App.user?.name || 'Usuário';
 
     // If preSelectedExpenses passed, or check loadedExpenses
@@ -380,6 +376,9 @@ const ExportsPage = {
         expsList = window.ExpensesPage.loadedExpenses.filter(e => preSelectedIds.includes(e.id));
       }
     }
+
+    let refYear = now.getFullYear();
+    let refMonthIndex = now.getMonth();
 
     let distinctUsers = [];
     if (expsList && expsList.length > 0) {
@@ -393,8 +392,16 @@ const ExportsPage = {
       }
       const dates = expsList.map(e => e.expense_date).filter(Boolean).sort();
       if (dates.length > 0) {
-        dateFromVal = dates[0];
-        dateToVal = dates[dates.length - 1];
+        const lastDate = dates[dates.length - 1]; // YYYY-MM-DD
+        const parts = lastDate.split('-');
+        if (parts.length >= 2) {
+          const y = parseInt(parts[0], 10);
+          const m = parseInt(parts[1], 10) - 1;
+          if (!isNaN(y) && !isNaN(m) && m >= 0 && m <= 11) {
+            refYear = y;
+            refMonthIndex = m;
+          }
+        }
       }
     } else {
       const userFilterEl = document.getElementById('filter-user');
@@ -403,18 +410,54 @@ const ExportsPage = {
       }
     }
 
+    const monthCapitalized = `${monthsPt[refMonthIndex]} de ${refYear}`;
+
+    // Primeiro dia do mês: YYYY-MM-01 (exibido como 01/MM/AAAA)
+    const mStr = String(refMonthIndex + 1).padStart(2, '0');
+    const dateFromVal = `${refYear}-${mStr}-01`;
+
+    // Último dia real do respectivo mês: new Date(year, month + 1, 0)
+    const lastDayOfMonth = new Date(refYear, refMonthIndex + 1, 0);
+    const dStrLast = String(lastDayOfMonth.getDate()).padStart(2, '0');
+    const dateToVal = `${refYear}-${mStr}-${dStrLast}`;
+
     const isMultipleUsers = distinctUsers.length > 1;
     const defaultReportName = `${targetUserName} - ${monthCapitalized}`;
 
+    function isParceriaAvare(cc) {
+      if (!cc) return false;
+      const code = String(cc.code || '');
+      const name = String(cc.name || '');
+      return code.includes('13901') || code.includes('14001') ||
+             name.includes('13901') || name.includes('14001');
+    }
+
+    function isMouraLeite(e) {
+      const comp = (e.cost_center && e.cost_center.company) || null;
+      const compId = comp ? comp.id : (e.cost_center ? e.cost_center.company_id : (e.company_id || 1));
+      const compCode = comp ? String(comp.code || '') : '';
+      const compName = comp ? String(comp.name || '').toUpperCase() : '';
+      return compId === 1 || compCode === '1' || compName.includes('MOURA LEITE DESENVOLVIMENTO') || !comp;
+    }
+
     let estimatedReportsCount = null;
+    let hasAvareGroup = false;
     if (expsList && expsList.length > 0) {
       const userCompPairs = new Set();
       expsList.forEach(e => {
         const uId = e.user_id || 'unknown';
+        const isML = isMouraLeite(e);
         const cId = (e.cost_center && e.cost_center.company && e.cost_center.company.id) ||
                     (e.cost_center && e.cost_center.company_id) ||
-                    e.company_id || 'default';
-        userCompPairs.add(`${uId}_${cId}`);
+                    e.company_id || 1;
+        if (isML) {
+          const isAvare = isParceriaAvare(e.cost_center);
+          if (isAvare) hasAvareGroup = true;
+          const subKey = isAvare ? 'avare' : 'geral';
+          userCompPairs.add(`${uId}_${cId}_${subKey}`);
+        } else {
+          userCompPairs.add(`${uId}_${cId}`);
+        }
       });
       estimatedReportsCount = userCompPairs.size;
     }
@@ -431,12 +474,12 @@ const ExportsPage = {
               ${hasPre ? `
                 <div><strong>${expCount} despesa(s)</strong> de <strong>${uCount} usuário(s)</strong> selecionada(s).</div>
                 <div style="font-size:12px;color:#15803d;margin-top:3px;">
-                  ${estimatedReportsCount ? `Previsão: <strong>${estimatedReportsCount} relatório(s)</strong> em PDF a serem gerados (um para cada empresa por usuário).` : `Será gerado um relatório para cada empresa por usuário.`}
+                  ${estimatedReportsCount ? `Previsão: <strong>${estimatedReportsCount} relatório(s)</strong> em PDF a serem gerados (separados por empresa e grupo Parceria Avaré).` : `Será gerado um relatório para cada empresa e grupo Parceria Avaré.`}
                 </div>
               ` : `
                 <div><strong>Modo Relatório em Massa</strong></div>
                 <div style="font-size:12px;color:#15803d;margin-top:3px;">
-                  Serão gerados relatórios separados para cada usuário e empresa com despesas no período selecionado.
+                  Serão gerados relatórios separados para cada usuário e empresa, com separação automática para Parceria Avaré (CC 13901/14001).
                 </div>
               `}
             </div>
@@ -445,10 +488,15 @@ const ExportsPage = {
       } else {
         if (!hasPre) return '';
         return `
-          <div class="nf-warning" style="background:var(--blue-bg);border:1px solid #BFDBFE;border-radius:8px;padding:12px 14px;color:var(--blue-text);display:flex;align-items:center;gap:10px;margin-bottom:0;">
-            <span style="font-size:18px;line-height:1;flex-shrink:0;">ℹ️</span>
+          <div class="nf-warning" style="background:var(--blue-bg);border:1px solid #BFDBFE;border-radius:8px;padding:12px 14px;color:var(--blue-text);display:flex;align-items:flex-start;gap:10px;margin-bottom:0;">
+            <span style="font-size:18px;line-height:1.2;flex-shrink:0;">ℹ️</span>
             <div style="flex:1;font-size:13px;line-height:1.4;">
-              <strong>${preSelectedIds.length} despesa(s)</strong> selecionada(s) serão incluídas neste relatório.
+              <div><strong>${preSelectedIds.length} despesa(s)</strong> selecionada(s) para o relatório.</div>
+              ${estimatedReportsCount && estimatedReportsCount > 1 ? `
+                <div style="font-size:12px;color:var(--blue-text);margin-top:3px;">
+                  Previsão: <strong>${estimatedReportsCount} relatório(s)</strong> em PDF a serem gerados (separados por empresa e grupo Parceria Avaré).
+                </div>
+              ` : ''}
             </div>
           </div>
         `;
@@ -568,6 +616,16 @@ const ExportsPage = {
         }
         Modal.close();
         this.loadExports();
+
+        // Se foi gerado um pacote ZIP com múltiplos relatórios, baixa o ZIP
+        if (res.zip_url) {
+          const aZip = document.createElement('a');
+          aZip.href = res.zip_url;
+          aZip.download = `Relatorios_${exportMode}_${new Date().toISOString().slice(0, 10)}.zip`;
+          document.body.appendChild(aZip);
+          aZip.click();
+          setTimeout(() => aZip.remove(), 1000);
+        }
 
         // Auto-download each generated export
         exportList.forEach((ex, idx) => {

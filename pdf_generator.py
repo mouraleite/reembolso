@@ -409,8 +409,19 @@ def generate_expense_pdf(expense, output_path: str):
     doc.build(story)
 
 
-def generate_export_pdf(expenses: list, export_name: str, output_path: str, filters: dict = None, generator_name: str = "Administrador", company_name: str = None, view_mode: str = "category"):
+def generate_export_pdf(expenses: list, export_name: str, output_path: str, filters: dict = None, generator_name: str = "Administrador", company_name: str = None, view_mode: str = "category", subtitle: str = None):
     """Gera PDF consolidado de exportação no layout corporativo idêntico ao modelo fornecido."""
+    # ── Detecção automática de Parceria Avaré caso subtitle não tenha sido fornecido ──
+    if not subtitle and expenses:
+        cc_list = [e.cost_center for e in expenses if getattr(e, "cost_center", None)]
+        if cc_list and all(
+            ("13901" in str(getattr(cc, "code", "") or "") or
+             "14001" in str(getattr(cc, "code", "") or "") or
+             "13901" in str(getattr(cc, "name", "") or "") or
+             "14001" in str(getattr(cc, "name", "") or ""))
+            for cc in cc_list
+        ):
+            subtitle = "Parceria Avaré"
     doc = SimpleDocTemplate(
         output_path, pagesize=A4,
         rightMargin=1.5*cm, leftMargin=1.5*cm,
@@ -465,6 +476,12 @@ def generate_export_pdf(expenses: list, export_name: str, output_path: str, filt
         story.append(Paragraph(
             f'<font color="#374151" size="9.5"><b>{html.escape(company_name)}</b></font>',
             ParagraphStyle("report_company_centered", alignment=TA_CENTER, leading=12)
+        ))
+    if subtitle:
+        story.append(Spacer(1, 0.25*cm))
+        story.append(Paragraph(
+            f'<font color="#1F2937" size="11"><b>{html.escape(subtitle)}</b></font>',
+            ParagraphStyle("report_subtitle_centered", alignment=TA_CENTER, leading=14)
         ))
     story.append(Spacer(1, 0.3*cm))
 

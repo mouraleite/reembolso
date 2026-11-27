@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import urllib.parse
@@ -15,6 +16,26 @@ from pdf_generator import generate_export_pdf
 from email_service import send_report_email
 
 router = APIRouter(prefix="/api/exports", tags=["exports"])
+
+
+def is_parceria_avare_cc(cost_center) -> bool:
+    if not cost_center:
+        return False
+    code = str(getattr(cost_center, 'code', '') or '')
+    name = str(getattr(cost_center, 'name', '') or '')
+    for target in ('13901', '14001'):
+        if target in code or target in name:
+            return True
+    return False
+
+
+def is_moura_leite_comp(comp) -> bool:
+    if not comp:
+        return True  # Empresa padrão é Moura Leite
+    code = str(getattr(comp, 'code', '') or '').strip()
+    name = str(getattr(comp, 'name', '') or '').upper()
+    comp_id = getattr(comp, 'id', None)
+    return comp_id == 1 or code == '1' or 'MOURA LEITE DESENVOLVIMENTO' in name
 
 IS_VERCEL = bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
 EXPORT_DIR = "/tmp/exports" if (IS_VERCEL or not os.path.exists("exports")) else "exports"
@@ -208,6 +229,7 @@ def create_export(
                 month_year_suffix = raw_name
 
             # Agrupar por usuário e, dentro de cada usuário, por empresa
+            # Com separação para Moura Leite: Grupo Parceria Avaré (CC 13901/14001) e Grupo Geral
             user_groups = OrderedDict()
             for exp in expenses:
                 uid = exp.user_id or 0
@@ -221,17 +243,27 @@ def create_export(
                     }
 
                 comp = exp.cost_center.company if (exp.cost_center and exp.cost_center.company) else None
+                is_ml = is_moura_leite_comp(comp)
+
                 if comp:
-                    c_key = f"comp_{comp.id}"
+                    base_c_key = f"comp_{comp.id}"
                     c_name = comp.name
                 else:
-                    c_key = f"comp_{ml_comp.id}" if ml_comp else "comp_default"
+                    base_c_key = f"comp_{ml_comp.id}" if ml_comp else "comp_1"
                     c_name = default_comp_name
+
+                # Se for da Moura Leite, divide em Parceria Avaré vs Geral
+                is_avare = is_ml and is_parceria_avare_cc(exp.cost_center)
+                if is_ml:
+                    c_key = f"{base_c_key}_avare" if is_avare else f"{base_c_key}_geral"
+                else:
+                    c_key = base_c_key
 
                 if c_key not in user_groups[uid]["companies"]:
                     user_groups[uid]["companies"][c_key] = {
                         "company_name": c_name,
                         "company": comp,
+                        "is_avare": is_avare,
                         "expenses": []
                     }
                 user_groups[uid]["companies"][c_key]["expenses"].append(exp)
@@ -247,9 +279,15 @@ def create_export(
                 for c_key, c_data in user_comps.items():
                     g_expenses = c_data["expenses"]
                     g_comp_name = c_data["company_name"]
+                    is_avare = c_data.get("is_avare", False)
 
-                    # Sempre inclui o nome da empresa no relatório para padronização e identificação visual na tela
-                    export_record_name = f"{base_user_report} - {g_comp_name}"
+                    pdf_subtitle = "Parceria Avaré" if is_avare else None
+
+                    # Sempre inclui o nome da empresa e o grupo no relatório para padronização e identificação visual na tela
+                    if is_avare:
+                        export_record_name = f"{base_user_report} - {g_comp_name} - Parceria Avaré"
+                    else:
+                        export_record_name = f"{base_user_report} - {g_comp_name}"
 
                     file_basename = f"exportacao_{timestamp}_{file_idx}.pdf"
                     rel_filename = f"exports/{file_basename}"
@@ -262,7 +300,8 @@ def create_export(
                         abs_filepath,
                         generator_name=current_user.name,
                         company_name=g_comp_name,
-                        view_mode=sort_key
+                        view_mode=sort_key,
+                        subtitle=pdf_subtitle
                     )
 
                     if storage.enabled():
@@ -289,21 +328,30 @@ def create_export(
 
                     created_exports.append(export)
         else:
-            # Modo Individual: agrupa apenas por empresa mantendo o nome fornecido
+            # Modo Individual: agrupa por empresa e quebra Parceria Avaré para Moura Leite
             groups = OrderedDict()
             for exp in expenses:
                 comp = exp.cost_center.company if (exp.cost_center and exp.cost_center.company) else None
+                is_ml = is_moura_leite_comp(comp)
+
                 if comp:
-                    c_key = f"comp_{comp.id}"
+                    base_c_key = f"comp_{comp.id}"
                     c_name = comp.name
                 else:
-                    c_key = f"comp_{ml_comp.id}" if ml_comp else "comp_default"
+                    base_c_key = f"comp_{ml_comp.id}" if ml_comp else "comp_1"
                     c_name = default_comp_name
+
+                is_avare = is_ml and is_parceria_avare_cc(exp.cost_center)
+                if is_ml:
+                    c_key = f"{base_c_key}_avare" if is_avare else f"{base_c_key}_geral"
+                else:
+                    c_key = base_c_key
 
                 if c_key not in groups:
                     groups[c_key] = {
                         "company_name": c_name,
                         "company": comp,
+                        "is_avare": is_avare,
                         "expenses": []
                     }
                 groups[c_key]["expenses"].append(exp)
@@ -312,15 +360,22 @@ def create_export(
             for idx, (group_key, g_data) in enumerate(groups.items(), start=1):
                 g_expenses = g_data["expenses"]
                 g_comp_name = g_data["company_name"]
+                is_avare = g_data.get("is_avare", False)
+                pdf_subtitle = "Parceria Avaré" if is_avare else None
 
                 exp_user_ids = list(set([exp.user_id for exp in g_expenses if getattr(exp, 'user_id', None)]))
                 target_uid = exp_user_ids[0] if exp_user_ids else None
 
                 if multiple_groups:
-                    export_record_name = f"{body.name} - {g_comp_name}"
+                    if is_avare:
+                        export_record_name = f"{body.name} - {g_comp_name} - Parceria Avaré"
+                    else:
+                        export_record_name = f"{body.name} - {g_comp_name}"
                     file_basename = f"exportacao_{timestamp}_{idx}.pdf"
                 else:
-                    if g_comp_name and g_comp_name.lower() not in body.name.lower():
+                    if is_avare:
+                        export_record_name = f"{body.name} - Parceria Avaré"
+                    elif g_comp_name and g_comp_name.lower() not in body.name.lower():
                         export_record_name = f"{body.name} - {g_comp_name}"
                     else:
                         export_record_name = body.name
@@ -335,7 +390,8 @@ def create_export(
                     abs_filepath,
                     generator_name=current_user.name,
                     company_name=g_comp_name,
-                    view_mode=sort_key
+                    view_mode=sort_key,
+                    subtitle=pdf_subtitle
                 )
 
                 if storage.enabled():
@@ -347,6 +403,7 @@ def create_export(
                 export = models.Export(
                     name=export_record_name,
                     created_by=current_user.id,
+                    target_uid=target_uid if hasattr(models.Export, 'target_uid') else None,
                     target_user_id=target_uid,
                     expense_user_ids=json.dumps(exp_user_ids) if exp_user_ids else None,
                     export_type="Padrão",
@@ -362,9 +419,33 @@ def create_export(
 
                 created_exports.append(export)
 
+        zip_url = None
+        if len(created_exports) > 1:
+            try:
+                import zipfile
+                zip_filename = f"exportacao_{timestamp}_pacote.zip"
+                zip_abs_path = os.path.join(EXPORT_DIR, zip_filename)
+                zip_rel_path = f"exports/{zip_filename}"
+                with zipfile.ZipFile(zip_abs_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for ex in created_exports:
+                        p_abs = os.path.join(EXPORT_DIR, os.path.basename(ex.file_path))
+                        if os.path.exists(p_abs):
+                            clean_pdf_name = re.sub(r'[\\/*?:"<>|]', '_', ex.name).strip()
+                            zipf.write(p_abs, arcname=f"{clean_pdf_name}.pdf")
+                if storage.enabled():
+                    try:
+                        storage.upload_file(zip_rel_path, zip_abs_path)
+                    except Exception as st_err:
+                        print(f"[exports] aviso ao enviar zip para storage: {st_err}")
+                zip_url = f"/api/exports/download-zip/{timestamp}"
+            except Exception as zip_err:
+                print(f"[exports] erro ao gerar pacote zip: {zip_err}")
+
         res = _export_dict(created_exports[0])
         res["exports"] = [_export_dict(e) for e in created_exports]
         res["count"] = len(created_exports)
+        if zip_url:
+            res["zip_url"] = zip_url
         return res
     except HTTPException:
         raise
@@ -391,6 +472,28 @@ def create_export(
             except Exception as ddl_err:
                 print(f"[export] auto-ddl error: {ddl_err}")
         raise HTTPException(status_code=500, detail=f"Erro ao gerar relatório: {str(e)}")
+
+
+@router.get("/download-zip/{timestamp}")
+def download_export_zip(
+    timestamp: int,
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    zip_filename = f"exportacao_{timestamp}_pacote.zip"
+    abs_path = os.path.join(EXPORT_DIR, zip_filename)
+    if not os.path.exists(abs_path) and storage.enabled():
+        data = storage.download_bytes(f"exports/{zip_filename}")
+        if data:
+            os.makedirs(EXPORT_DIR, exist_ok=True)
+            with open(abs_path, "wb") as f:
+                f.write(data)
+    if os.path.exists(abs_path):
+        return FileResponse(
+            abs_path,
+            filename=f"Relatorios_{timestamp}.zip",
+            media_type="application/zip"
+        )
+    raise HTTPException(404, "Arquivo ZIP não encontrado.")
 
 
 @router.get("/{export_id}/download")
