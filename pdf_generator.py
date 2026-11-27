@@ -187,16 +187,73 @@ def get_category_full_name(category, expense=None) -> str:
 
 
 def _get_logo_flowable():
+    # 1. Tenta carregar o logo cadastrado no banco de dados (CompanyLogo)
+    try:
+        from database import SessionLocal
+        import models
+        db = SessionLocal()
+        logo_entry = db.query(models.CompanyLogo).first()
+        if logo_entry and logo_entry.data:
+            data = logo_entry.data.strip()
+            if data.startswith("data:image"):
+                import base64
+                from io import BytesIO
+                from PIL import Image as PILImage
+                header, b64_data = data.split(",", 1)
+                img_bytes = base64.b64decode(b64_data)
+                pil_img = PILImage.open(BytesIO(img_bytes))
+                w, h = pil_img.size
+                if w > 0 and h > 0:
+                    aspect = w / h
+                    target_height = 1.4 * cm
+                    target_width = target_height * aspect
+                    if target_width > 6.0 * cm:
+                        target_width = 6.0 * cm
+                        target_height = target_width / aspect
+                    db.close()
+                    return RLImage(BytesIO(img_bytes), width=target_width, height=target_height)
+            elif (data.startswith("/static/") or data.startswith("static/")) and data.lower().endswith((".png", ".jpg", ".jpeg")):
+                clean_path = data.lstrip("/")
+                if os.path.exists(clean_path):
+                    from PIL import Image as PILImage
+                    pil_img = PILImage.open(clean_path)
+                    w, h = pil_img.size
+                    if w > 0 and h > 0:
+                        aspect = w / h
+                        target_height = 1.4 * cm
+                        target_width = target_height * aspect
+                        if target_width > 6.0 * cm:
+                            target_width = 6.0 * cm
+                            target_height = target_width / aspect
+                        db.close()
+                        return RLImage(clean_path, width=target_width, height=target_height)
+        db.close()
+    except Exception:
+        pass
+
+    # 2. Logo padrão oficial Moura Leite com a palavra LOTEAMENTOS perfeitamente centralizada
     logo_icon_path = os.path.join("static", "icons", "logo-icon.png")
     if os.path.exists(logo_icon_path):
         try:
             icon_img = RLImage(logo_icon_path, width=1.4*cm, height=1.4*cm)
-            text_para = Paragraph(
-                '<font color="#15803D" size="14"><b>MOURA LEITE</b></font><br/>'
-                '<font color="#166534" size="8">LOTEAMENTOS</font>',
-                getSampleStyleSheet()["Normal"]
+            para_moura = Paragraph(
+                '<font color="#15803D" size="13.5"><b>MOURA LEITE</b></font>',
+                ParagraphStyle("moura_title", fontName="Helvetica-Bold", alignment=TA_CENTER, leading=15)
             )
-            logo_table = Table([[icon_img, text_para]], colWidths=[1.6*cm, 4.5*cm])
+            para_lote = Paragraph(
+                '<font color="#166534" size="7.5"><b>LOTEAMENTOS</b></font>',
+                ParagraphStyle("lote_sub", fontName="Helvetica-Bold", alignment=TA_CENTER, leading=9)
+            )
+            text_table = Table([[para_moura], [para_lote]], colWidths=[3.3*cm])
+            text_table.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]))
+
+            logo_table = Table([[icon_img, text_table]], colWidths=[1.6*cm, 3.5*cm])
             logo_table.setStyle(TableStyle([
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 0),
@@ -400,16 +457,16 @@ def generate_export_pdf(expenses: list, export_name: str, output_path: str, filt
 
     # ── 2. Título Centralizado e Nome da Empresa logo abaixo ─────────────────
     story.append(Paragraph(
-        f'<font color="#1F2937" size="15"><b>{html.escape(export_name or "")}</b></font>',
-        ParagraphStyle("report_title_centered", alignment=TA_CENTER, leading=18)
+        f'<font color="#1F2937" size="12"><b>{html.escape(export_name or "")}</b></font>',
+        ParagraphStyle("report_title_centered", alignment=TA_CENTER, leading=15)
     ))
     if company_name:
-        story.append(Spacer(1, 0.55*cm))
+        story.append(Spacer(1, 0.3*cm))
         story.append(Paragraph(
-            f'<font color="#374151" size="11"><b>{html.escape(company_name)}</b></font>',
-            ParagraphStyle("report_company_centered", alignment=TA_CENTER, leading=14)
+            f'<font color="#374151" size="9.5"><b>{html.escape(company_name)}</b></font>',
+            ParagraphStyle("report_company_centered", alignment=TA_CENTER, leading=12)
         ))
-    story.append(Spacer(1, 0.4*cm))
+    story.append(Spacer(1, 0.3*cm))
 
     # ── 3. Sub-rótulo à Direita conforme a seleção ────────────────────────────
     if view_mode == "cost_center":
